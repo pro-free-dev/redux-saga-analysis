@@ -188,4 +188,62 @@ function runAllEffect(env, effects, cb, { digestEffect }) {
 2. `takeEvery`会分解成`fork`和`take`两个task。
    1. `fork` 会通过`parent.queue.addTask`将子task添加至父task的queue中
    2. `take` 会通过`channel.take`将`cb(input)`放入`channel`对象中。这里是实际的saga函数，redux触发action后触发`channel.put(action)`，整个流程监听的起点就在这里。这里的`channel --> env.channel`是runSaga函数中初始化的`channel`全局对象。
-   3. TODO: `fork`的任务什么时候被触发的？
+   3. `fork`的任务什么时候被触发的？当`next()`函数循环执行`generator`函数到`done`状态时，会执行`mainTask.cont(result.value)`，而`cont`对应的会执行到`newTask`的`end`方法。
+
+**newTask.end()**
+```js
+  task.cont(result, isErr)
+    task.joiners.forEach(joiner => {
+      joiner.cb(result, isErr)
+    }).forEach(key => {
+    // 执行的就是 runEffect
+    digestEffect(effects[key], effectId, childCallbacks[key], key)
+  })
+}
+```
+到这里`saga`中间件的`middleWares`和`runSaga`部分已经讲完，对注入saga函数和监听触发也清楚了其运行方式。代码分析下来，其中主要时各种回调看起来比较绕。核心函数`proc`需要通过添加`log`和断点的方式进行信息查看，有上下文数据理解起来会比较清晰。`channel.put(action)`触发`task`这里比较容易理解。但对于`takeEvery`等任务是如何实现循环监听的，就需要进一步分析`sagaHelpers`库，对它们进行解读和调试，了解其运行的原理。
+
+
+## 3.sagaHelpers
+sagaHelpers提供了实用的函数，能帮助我们简化代码。`takeLatest`适用于网络请求多次发送时，主动取消前一次的请求，使用最新请求参数得到的接口响应来渲染页面。业务代码不用再去判断请求和响应是否对应。`takeEvery`是最常用的saga函数，写业务代码时，需要监听某个`action`这时就会用到它。
+
+```js
+export { default as takeEveryHelper } from './takeEvery'
+export { default as takeLatestHelper } from './takeLatest'
+export { default as takeLeadingHelper } from './takeLeading'
+export { default as throttleHelper } from './throttle'
+export { default as retryHelper } from './retry'
+export { default as debounceHelper } from './debounce'
+```
+
+下面来分析`takeEvery`的实现：
+- `take` 是一个task，执行match的action，take状态执行到done时，监听流转到yFork
+- `yFork` 是一个监听，监听到匹配的action时，触发yTake
+- q1 和 q2 return中的nextState是一个循环，它的执行顺序是这样的：q1 --> q2 --> q1 ...
+- 
+```js
+export default function takeEvery(patternOrChannel, worker, ...args) {
+  // take 是一个task，执行match的action，take状态执行到done时，监听流转到yFork
+  const yTake = { done: false, value: take(patternOrChannel) }
+  // yFork 是一个监听，监听到匹配的action时，触发yTake
+  const yFork = ac => ({ done: false, value: fork(worker, ...args, ac) })
+
+  let action,
+    setAction = ac => (action = ac)
+
+    // q1 和 q2 return中的nextState是一个循环
+    // 它的执行顺序是这样的：q1 --> q2 --> q1 ...
+  return fsmIterator(
+    {
+      q1() {
+        return { nextState: 'q2', effect: yTake, stateUpdater: setAction }
+      },
+      q2() {
+        return { nextState: 'q1', effect: yFork(action) }
+      },
+    },
+    'q1', // 默认执行任务q1
+    `takeEvery(${safeName(patternOrChannel)}, ${worker.name})`,
+  )
+}
+```
