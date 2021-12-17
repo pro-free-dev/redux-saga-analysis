@@ -39,7 +39,7 @@ const action = type => store.dispatch({type})
 `const sagaMiddleware = createSagaMiddleware()` 这行代码，是中间件的引入，一切从这里开始。它是`sagaMiddlewareFactory`函数的返回对象，并且在返回前给`sagaMiddleware`挂载了`runSaga`方法。`sagaMiddlewareFactory`里做了以下3件事情：
 1. 定义sagaMiddleware函数，并且返回这个函数
 2. sagaMiddleware.run，添加`run`函数，用于将`generator`函数添加channel和forkQueue中，在后续dispatch时响应函数
-3. sagaMiddleware.setContext，**没有使用到，待研究**
+3. sagaMiddleware.setContext，**TODO: 没有使用到，未研究**
 
 ### `sagaMiddleware`函数
 直接贴上这个函数的代码，解释直接写在注释中
@@ -161,7 +161,7 @@ export function runSaga(
       1. `is.promise`则执行`resolvePromise`
       2. `is.iterator`则执行`proc`
       3. `effect[IO]`则执行`effectRunnerMap[IO]`，当前执行的是`runAllEffect`函数，对所有saga generator进行循环执行。
-         1. `runAllEffect`执行的逻辑是
+         1. `runAllEffect`执行的逻辑是通过 `forEach`去调用`digestEffect(effects[key], effectId, childCallbacks[key], key)`，实际执行的就是`runEffect`
       4. `currCb(effect)`
 
 我们接着看`runAllEffect`这个函数的执行逻辑。`keys`就是rootSaga中的function，`keys.forEach`是循环执行每一个saga generator，并且存放到前面提到的`mainTask`任务数组中去。
@@ -247,3 +247,6 @@ export default function takeEvery(patternOrChannel, worker, ...args) {
   )
 }
 ```
+
+## 小结
+- 2021/12/17 源码分析部分就到这，`takeLatest`的源码有空再补充上来。
