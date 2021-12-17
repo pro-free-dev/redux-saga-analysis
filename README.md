@@ -1,6 +1,6 @@
 # redux-saga 源码分析
 
-项目中使用到了`redux-saga`，看着文档各种`generator`和`helpers`函数，为加深自己的理解，因而决得有必要深入源码，了解下它的实现方式。
+项目中使用到了`redux-saga`，看着文档各种`generator`和`helpers`函数一头雾水，为加深自己的理解，因而觉得有必要深入源码，了解下它的实现方式。
 
 先看概览图，看一看它的全貌，本文主要从以下三部分进行分析：
 1. `sagaMiddleware`
@@ -10,8 +10,8 @@
 <img src='https://user-images.githubusercontent.com/13233825/146486378-9c45dc55-2b65-4c65-9c8f-cdd1ff7fc26e.png' width='800px'>
 
 
-## sagaMiddleware
-官方文档中，示意代码如下：
+## 1.sagaMiddleware
+官方文档中，引入`saga`中间件，示意代码如下：
 
 ```js
 // ...
@@ -36,225 +36,115 @@ const action = type => store.dispatch({type})
 
 
 
+`const sagaMiddleware = createSagaMiddleware()` 这行代码，是中间件的引入，一切从这里开始。它是`sagaMiddlewareFactory`函数的返回对象，并且在返回前给`sagaMiddleware`挂载了`runSaga`方法。`sagaMiddlewareFactory`里做了以下3件事情：
+1. 定义sagaMiddleware函数，并且返回这个函数
+2. sagaMiddleware.run，添加`run`函数，用于将`generator`函数添加channel和forkQueue中，在后续dispatch时响应函数
+3. sagaMiddleware.setContext，**没有使用到，待研究**
 
-```javascript
-import { createStore, applyMiddleware } from 'redux'
-import createSagaMiddleware from 'redux-saga'
+### `sagaMiddleware`函数
+直接贴上这个函数的代码，解释直接写在注释中
+```js
+function sagaMiddleware({ getState, dispatch }) {
+    // 将 runSaga 函数指向函数变量 boundRunSaga
+    // null: this为函数runSaga自身
+    // {}: 绑定参数
+    boundRunSaga = runSaga.bind(null, {
+      ...options,
+      context,
+      channel,
+      dispatch,
+      getState,
+      sagaMonitor,
+    })
 
-import reducer from './reducers'
-import mySaga from './sagas'
+    // 标准的 redux 中间件函数写法
+    return next => action => {
+      if (sagaMonitor && sagaMonitor.actionDispatched) {
+        sagaMonitor.actionDispatched(action)
+      }
+      const result = next(action) // hit reducers
 
-// create the saga middleware
-const sagaMiddleware = createSagaMiddleware()
-// mount it on the Store
-const store = createStore(
-  reducer,
-  applyMiddleware(sagaMiddleware)
-)
-
-// then run the saga
-sagaMiddleware.run(mySaga)
-
-// render the application
+      // 从这里可以看到，是在reducer之后才会触发saga监听的action
+      // 问题1：如果reducer中改变了数据，而saga函数中想获得改变前的数据时，如何获取呢？
+      // 问题2：channel 什么时候赋值的呢？
+      channel.put(action)
+      return result
+    }
+  }
 ```
 
-# Documentation
+> 问题1：如果reducer中改变了数据，而saga函数中想获得改变前的数据时，如何获取呢？
+- 方法1：可以将修改state的代码放入saga函数中，reducer里只做返回新数据对象。比较推荐这种写法，可以将业务代码都限定在saga中。
+- 方法2：自己实现中间件，将数据保存在action或context中。
+> 问题2：channel 什么时候赋值的呢？
+- runSaga中会将监听的action添加至channel中
 
-- [Introduction](https://redux-saga.js.org/docs/introduction/BeginnerTutorial.html)
-- [Basic Concepts](https://redux-saga.js.org/docs/basics/DeclarativeEffects)
-- [Advanced Concepts](https://redux-saga.js.org/docs/advanced/Channels)
-- [Recipes](https://redux-saga.js.org/docs/recipes/index.html)
-- [External Resources](https://redux-saga.js.org/docs/ExternalResources.html)
-- [Troubleshooting](https://redux-saga.js.org/docs/Troubleshooting.html)
-- [Glossary](https://redux-saga.js.org/docs/Glossary.html)
-- [API Reference](https://redux-saga.js.org/docs/api/index.html)
+## 2.runSaga
+```js
+// run: 是上面的 boundRunSaga 函数，是sagaMiddleware返回时挂载的上来的
+// helloSaga: 业务逻辑中写的generator函数
+sagaMiddleware.run(helloSaga)
 
-# Translation
-
-- [Chinese](https://github.com/superRaytin/redux-saga-in-chinese)
-- [Traditional Chinese](https://github.com/neighborhood999/redux-saga)
-- [Japanese](https://github.com/redux-saga/redux-saga/blob/master/README_ja.md)
-- [Korean](https://github.com/mskims/redux-saga-in-korean)
-- [Portuguese](https://github.com/joelbarbosa/redux-saga-pt_BR)
-- [Russian](https://github.com/redux-saga/redux-saga/blob/master/README_ru.md)
-
-# Using umd build in the browser
-
-There is also a **umd** build of `redux-saga` available in the `dist/` folder. When using the umd build `redux-saga` is available as `ReduxSaga` in the window object. This enables you to create Saga middleware without using ES6 `import` syntax like this:
-
-```javascript
-var sagaMiddleware = ReduxSaga.default()
+// runSga函数在源码的 ./src/internal/runSaga.js 文件中
 ```
 
-The umd version is useful if you don't use Webpack or Browserify. You can access it directly from [unpkg](https://unpkg.com/).
+下面还是贴源码加注释的方式进行解读，对源码进行了部分删减，我们关注核心部分，即`runSaga`做了哪些事情
+```jsx
+// 入参有三个
+// 参数1：sagaMiddlewareFactory中bindRunSaga时已经赋值，都是一些默认参数，也可以自定义传入
+// 参数2：核心，我们写的saga函数
+// 参数3：说明在run(saga,...otherArguments)时我们还可以传入 otherArguments 其他参数
+export function runSaga(
+  { channel = stdChannel(), dispatch, getState, context = {}, sagaMonitor, effectMiddlewares, onError = logError },
+  saga,
+  ...args
+) {
 
-The following builds are available:
+  // 核心：saga对应的是rootSaga函数，也就是我们的业务saga的入口
+  // rootSaga {<suspended>}
+  //   [[GeneratorLocation]]: VM155:1
+  //   [[Prototype]]: Generator
+  //   [[GeneratorState]]: "suspended"
+  //   [[GeneratorFunction]]: ƒ* rootSaga()
+  //   [[GeneratorReceiver]]: Window
+  //   [[Scopes]]: Scopes[2]
+  const iterator = saga(...args)
 
-- [https://unpkg.com/redux-saga/dist/redux-saga.umd.js](https://unpkg.com/redux-saga/dist/redux-saga.umd.js)
-- [https://unpkg.com/redux-saga/dist/redux-saga.umd.min.js](https://unpkg.com/redux-saga/dist/redux-saga.umd.min.js)
+  // 这里如果没有传入effectMiddlewares，那么这个函数执行的是他本身
+  // 默认就是执行原函数
+  // export const identity = v => v
+  let finalizeRunEffect
+  if (effectMiddlewares) {
+    const middleware = compose(...effectMiddlewares)
+    finalizeRunEffect = runEffect => {
+      return (effect, effectId, currCb) => {
+        const plainRunEffect = eff => runEffect(eff, effectId, currCb)
+        return middleware(plainRunEffect)(effect)
+      }
+    }
+  } else {
+    finalizeRunEffect = identity
+  }
 
-**Important!** If the browser you are targeting doesn't support *ES2015 generators*, you must transpile them (i.e. with [babel plugin](https://github.com/facebook/regenerator/tree/master/packages/regenerator-transform)) and provide a valid runtime, such as [the one here](https://unpkg.com/regenerator-runtime/runtime.js). The runtime must be imported before **redux-saga**:
+  // channel: 我们写的saga函数是一个task，channel是管理这些task的列表
+  // wrapSagaDispatch 的作用是在action上添加 saga 标签，用来判断当前是支持
+  // return dispatch(Object.defineProperty(action, SAGA_ACTION, { value: true }))
+  // TODO：待理解SAGA_ACTION的作用
+  const env = {
+    channel,
+    dispatch: wrapSagaDispatch(dispatch),
+    getState,
+    sagaMonitor,
+    onError,
+    finalizeRunEffect,
+  }
 
-```javascript
-import 'regenerator-runtime/runtime'
-// then
-import sagaMiddleware from 'redux-saga'
+  return immediately(() => {
+    // 执行 iterator
+    const task = proc(env, iterator, context, effectId, getMetaInfo(saga), /* isRoot */ true, undefined)
+    return task
+  })
 ```
 
-# Building examples from sources
 
-```sh
-$ git clone https://github.com/redux-saga/redux-saga.git
-$ cd redux-saga
-$ yarn
-$ npm test
-```
-
-Below are the examples ported (so far) from the Redux repos.
-
-### Counter examples
-
-There are three counter examples.
-
-#### counter-vanilla
-
-Demo using vanilla JavaScript and UMD builds. All source is inlined in `index.html`.
-
-To launch the example, open `index.html` in your browser.
-
-> Important: your browser must support Generators. Latest versions of Chrome/Firefox/Edge are suitable.
-
-#### counter
-
-Demo using `webpack` and high-level API `takeEvery`.
-
-```sh
-$ npm run counter
-
-# test sample for the generator
-$ npm run test-counter
-```
-
-#### cancellable-counter
-
-Demo using low-level API to demonstrate task cancellation.
-
-```sh
-$ npm run cancellable-counter
-```
-
-### Shopping Cart example
-
-```sh
-$ npm run shop
-
-# test sample for the generator
-$ npm run test-shop
-```
-
-### async example
-
-```sh
-$ npm run async
-
-# test sample for the generators
-$ npm run test-async
-```
-
-### real-world example (with webpack hot reloading)
-
-```sh
-$ npm run real-world
-
-# sorry, no tests yet
-```
-
-### TypeScript
-
-Redux-Saga with TypeScript requires `DOM.Iterable` or `ES2015.Iterable`. If your `target` is `ES6`, you are likely already set, however, for `ES5`, you will need to add it yourself.
-Check your `tsconfig.json` file, and the official <a href="https://www.typescriptlang.org/docs/handbook/compiler-options.html">compiler options</a> documentation.
-
-### Logo
-
-You can find the official Redux-Saga logo with different flavors in the [logo directory](https://github.com/redux-saga/redux-saga/tree/master/logo).
-
-
-## Redux Saga chooses generators over `async/await`
-
-A [few](https://github.com/redux-saga/redux-saga/issues/1373#issuecomment-381320534) [issues](https://github.com/redux-saga/redux-saga/issues/987#issuecomment-301039792) have been raised asking whether Redux saga plans to use `async/await` syntax instead of generators.
-
-We will continue to use [generators](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Generator). The primary mechanism of `async/await` is Promises and it is very difficult to retain the scheduling simplicity and semantics of existing Saga concepts using Promises. `async/await` simply don't allow for certain things - like i.e. cancellation. With generators we have full power over how & when effects are executed.
-
-## Backers
-Support us with a monthly donation and help us continue our activities. \[[Become a backer](https://opencollective.com/redux-saga#backer)\]
-
-<a href="https://opencollective.com/redux-saga/backer/0/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/0/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/1/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/1/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/2/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/2/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/3/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/3/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/4/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/4/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/5/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/5/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/6/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/6/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/7/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/7/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/8/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/8/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/9/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/9/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/10/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/10/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/11/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/11/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/12/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/12/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/13/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/13/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/14/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/14/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/15/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/15/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/16/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/16/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/17/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/17/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/18/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/18/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/19/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/19/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/20/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/20/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/21/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/21/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/22/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/22/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/23/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/23/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/24/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/24/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/25/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/25/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/26/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/26/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/27/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/27/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/28/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/28/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/backer/29/website" target="_blank"><img src="https://opencollective.com/redux-saga/backer/29/avatar.svg"></a>
-
-
-### Sponsors
-Become a sponsor and get your logo on our README on Github with a link to your site. \[[Become a sponsor](https://opencollective.com/redux-saga#sponsor)\]
-
-<a href="https://opencollective.com/redux-saga/sponsor/0/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/0/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/1/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/1/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/2/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/2/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/3/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/3/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/4/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/4/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/5/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/5/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/6/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/6/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/7/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/7/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/8/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/8/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/9/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/9/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/10/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/10/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/11/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/11/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/12/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/12/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/13/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/13/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/14/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/14/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/15/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/15/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/16/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/16/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/17/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/17/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/18/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/18/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/19/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/19/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/20/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/20/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/21/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/21/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/22/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/22/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/23/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/23/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/24/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/24/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/25/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/25/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/26/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/26/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/27/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/27/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/28/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/28/avatar.svg"></a>
-<a href="https://opencollective.com/redux-saga/sponsor/29/website" target="_blank"><img src="https://opencollective.com/redux-saga/sponsor/29/avatar.svg"></a>
-
-## License
-Copyright (c) 2015 Yassine Elouafi.
-
-Licensed under The MIT License (MIT).
+### 2.1 proc
